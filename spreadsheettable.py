@@ -1,8 +1,13 @@
-from decimal import Decimal as D, InvalidOperation as DConversionError
+# -*- coding: utf-8 -*-
+
+__author__ = u'Tomasz Świderski <contact@tomaszswiderski.com>'
+__copyright__ = u'Copyright (c) 2010 Tomasz Świderski'
 
 from reportlab.platypus.tables import *
 from reportlab.platypus.tables import (_rowLen, _calc_pc, _hLine, _multiLine,
     _convert2int, _endswith, _isLineCommand, _setCellStyle)
+
+from formula import Formula
 
 def spanFixDim(V0,V,spanCons,FUZZ=rl_config._FUZZ):
     #assign required space to variable rows equally to existing calculated values
@@ -232,7 +237,7 @@ class SpreadsheetTable(Flowable):
                     if ji in colSpanCells and not span: #if the current cell is part of a spanned region,
                         t = 0.0                         #assume a zero size.
                     else:#work out size
-                        t = self._elementWidth(v,s)
+                        t = self._elementWidth(v, s, (j, i))
                         if t is None:
                             raise ValueError("Flowable %s in cell(%d,%d) can't have auto width\n%s" % (v.identity(30),i,j,self.identity(30)))
                         t += s.leftPadding+s.rightPadding
@@ -260,7 +265,7 @@ class SpreadsheetTable(Flowable):
         self._width = width
         self._width_calculated_once = 1
 
-    def _elementWidth(self,v,s):
+    def _elementWidth(self, v, s, cellcoord):
         if isinstance(v,(list,tuple)):
             w = 0
             for e in v:
@@ -272,8 +277,8 @@ class SpreadsheetTable(Flowable):
             if hasattr(v, 'width') and isinstance(v.width,(int,float)): return v.width
             if hasattr(v, 'drawWidth') and isinstance(v.drawWidth,(int,float)): return v.drawWidth
         elif isinstance(v, Formula):
-            w = v.get_max_width(s)
-            return w
+            v = v.get_max_value(self._cellvalues, self.repeatRows,
+                self._repeatRowsB, cellcoord)
         # Even if something is fixedWidth, the attribute to check is not
         # necessarily consistent (cf. Image.drawWidth).  Therefore, we'll
         # be extra-careful and fall through to this code if necessary.
@@ -466,7 +471,8 @@ class SpreadsheetTable(Flowable):
                 for rowNo in xrange(self._nrows):
                     value = self._cellvalues[rowNo][colNo]
                     style = self._cellStyles[rowNo][colNo]
-                    new = elementWidth(value,style)+style.leftPadding+style.rightPadding
+                    new = elementWidth(value,style, (colNo, rowNo))
+                    new += style.leftPadding + style.rightPadding
                     final = max(current, new)
                     current = new
                     siz = siz and self._canGetWidth(value) # irrelevant now?
@@ -584,8 +590,8 @@ class SpreadsheetTable(Flowable):
                 for rowNo in rowNos:
                     value = values[rowNo][colNo]
                     style = styles[rowNo][colNo]
-                    new = (elementWidth(value,style)+
-                           style.leftPadding+style.rightPadding)
+                    new = (elementWidth(value, style, (colNo, rowNo)) +
+                        style.leftPadding + style.rightPadding)
                     final = max(final, new)
                 width += final
             else:
@@ -1170,7 +1176,7 @@ class SpreadsheetTable(Flowable):
                         cellval = cellval(self._cellvalues, self.repeatRows,
                             self._repeatRowsB,
                             (activeRows0, self._activeRows[1]),
-                            (colNo, rowNo), cellstyle, colwidth)
+                            (colNo, rowNo))
                     self._drawCell(cellval, cellstyle, (colpos, rowpos),
                         (colwidth, rowheight))
         else:
@@ -1187,7 +1193,7 @@ class SpreadsheetTable(Flowable):
                             cellval = cellval(self._cellvalues,
                                 self.repeatRows, self._repeatRowsB,
                                 (activeRows0, self._activeRows[1]),
-                                (colNo, rowNo), cellstyle, width)
+                                (colNo, rowNo))
                         self._drawCell(cellval, cellstyle, (x, y),
                             (width, height))
         self._drawLines()
@@ -1380,357 +1386,7 @@ _LineOpMap = {  'GRID':'_drawGrid',
                 'LINEAFTER':'_drawLineAfter', }
 
 
-class Formula(object):
-
-    """
-    Abstract class of all formulas.
-    """
-
-    NO_ENOUGH_SPACE = '###'
-
-    def __init__(self, longest_value=NO_ENOUGH_SPACE,
-        ignore_no_enough_space=True):
-
-        if not isinstance(longest_value, str):
-            raise TypeError('Formula longest_value must be str!')
-        if len(longest_value) < 3:
-            raise ValueError('longest_value must have at least 3 characters!')
-        # This value will be used to determine cell width during Table's
-        # self._calc_width.
-        self._longest_value = longest_value
-        self._ignore_no_enough_space = ignore_no_enough_space
-
-    def __call__(self, data, repeat_rows, repeat_rows_b, active_rows,
-        cell_coord, cell_style, cell_width):
-        """
-        Returns tuple of evaluated value. First position is value to be
-        drawn, second real evaluated value. First position can contain ###
-        instead of real value if there is not enough space to draw it.
-        Second position should be used by other formulas since it's always
-        contains real data.
-        """
-        value = self._evaluate(data, repeat_rows, repeat_rows_b, active_rows,
-            cell_coord)
-        value_width = stringWidth(value, cell_style.fontname,
-            cell_style.fontsize)
-        cell_width -= cell_style.leftPadding + cell_style.rightPadding
-        if value_width > cell_width:
-            if not self._ignore_no_enough_space:
-                raise ValueError('Formula value won\'t fit into cell!')
-            value = self.NO_ENOUGH_SPACE
-
-        return value
-
-    def get_max_width(self, cell_style):
-        """
-        Returns length of longest_value based on cell_style information.
-        """
-        width = stringWidth(self._longest_value, cell_style.fontname,
-            cell_style.fontsize)
-
-        return width
-
-    def _evaluate(self, data, repeat_rows, repeat_rows_b, active_rows,
-        cell_coord):
-        """
-        This method should return evaluated string value.
-        """
-        raise NotImplementedError
-
-
-class PageColSum(Formula):
-
-    """
-    Calculates sum of column from current page only.
-    """
-
-    def __init__(self, ignore_convert_errors=True, longest_value='100.00'):
-        Formula.__init__(self, longest_value)
-        self._ignore = ignore_convert_errors
-
-    def _evaluate(self, data, repeat_rows, repeat_rows_b, active_rows,
-        cell_coord):
-        """
-        Calculates sum of column up to current formula coordinates.
-        All data will be converted to decimals. Unconvertable values
-        can be ignored or cause to raise Exception depending of settings.
-        """
-        # Takes slice of data which will be used in evaluation.
-        cell_row = cell_coord[1]
-        if active_rows[0] <= cell_row < active_rows[1]:
-            raise ValueError('Formula inside range to be evaluated!')
-
-        active_data = data[active_rows[0]:active_rows[1]]
-
-        col_num = cell_coord[0]
-        sum = D(0)
-
-        for row_num, row in enumerate(active_data):
-            col_value = row[col_num]
-            if isinstance(col_value, Formula):
-                col_value = col_value._evaluate(data, repeat_rows,
-                    repeat_rows_b, active_rows,
-                    (col_num, row_num + active_rows[0]))
-            try:
-                value = D(col_value)
-            except DConversionError:
-                if not self._ignore:
-                    raise
-                continue
-            sum += value
-
-        return '%.2f' % sum
-
-
-class PreviousPagesColSum(Formula):
-
-    """
-    Calculates sum of column from previous pages.
-    """
-
-    def __init__(self, starting_value=D(0), ignore_convert_errors=True,
-        longest_value='100.00'):
-
-        Formula.__init__(self, longest_value)
-        self._ignore = ignore_convert_errors
-        self._starting_value = starting_value
-
-    def _evaluate(self, data, repeat_rows, repeat_rows_b, active_rows,
-        cell_coord):
-        """
-        Calculates sum of column up to current formula coordinates.
-        All data will be converted to decimals. Unconvertable values
-        can be ignored or cause to raise Exception depending of settings.
-        """
-        # Takes slice of data which will be used in evaluation.
-        cell_row = cell_coord[1]
-        if repeat_rows <= cell_row < active_rows[0]:
-            raise ValueError('Formula inside range to be evaluated!')
-
-        active_data = data[repeat_rows:active_rows[0]]
-
-        col_num = cell_coord[0]
-        sum = self._starting_value
-
-        for row_num, row in enumerate(active_data):
-            col_value = row[col_num]
-            if isinstance(col_value, Formula):
-                col_value = col_value._evaluate(data, repeat_rows,
-                    repeat_rows_b, active_rows,
-                    (col_num, row_num + active_rows[0]))
-            try:
-                value = D(col_value)
-            except DConversionError:
-                if not self._ignore:
-                    raise
-                continue
-            sum += value
-
-        return '%.2f' % sum
-
-
-class TotalPagesColSum(Formula):
-
-    """
-    Calculates sum of column from previous pages and current page.
-    """
-
-    def __init__(self, starting_value=D(0), ignore_convert_errors=True,
-        longest_value='100.00'):
-
-        Formula.__init__(self, longest_value)
-        self._ignore = ignore_convert_errors
-        self._starting_value = starting_value
-
-    def _evaluate(self, data, repeat_rows, repeat_rows_b, active_rows,
-        cell_coord):
-        """
-        Calculates sum of column up to current formula coordinates.
-        All data will be converted to decimals. Unconvertable values
-        can be ignored or cause to raise Exception depending of settings.
-        """
-        # Takes slice of data which will be used in evaluation.
-        cell_row = cell_coord[1]
-        if repeat_rows <= cell_row < active_rows[1]:
-            raise ValueError('Formula inside range to be evaluated!')
-
-        active_data = data[repeat_rows:active_rows[1]]
-
-        col_num = cell_coord[0]
-        sum = self._starting_value
-
-        for row_num, row in enumerate(active_data):
-            col_value = row[col_num]
-            if isinstance(col_value, Formula):
-                col_value = col_value._evaluate(data, repeat_rows,
-                    repeat_rows_b, active_rows,
-                    (col_num, row_num + active_rows[0]))
-            try:
-                value = D(col_value)
-            except DConversionError:
-                if not self._ignore:
-                    raise
-                continue
-            sum += value
-
-        return '%.2f' % sum
-
-
-class RowSum(Formula):
-
-    """
-    Calculates sum of row values left of Forumula class.
-    """
-
-    def __init__(self, ignore_convert_errors=True, longest_value='100.00'):
-        Formula.__init__(self, longest_value)
-        self._ignore = ignore_convert_errors
-
-    def _evaluate(self, data, repeat_rows, repeat_rows_b, active_rows,
-        cell_coord):
-        """
-        Calculates sum of row values left of formula coordinates.
-        All data will be converted to decimals. Unconvertable values
-        can be ignored or cause to raise Exception depending of settings.
-        """
-        sum = D(0)
-
-        row_num = cell_coord[1]
-        row = data[row_num]
-        for col_num, col_value in enumerate(row[:cell_coord[0]]):
-            if isinstance(col_value, Formula):
-                col_value = col_value._evaluate(data, repeat_rows,
-                    repeat_rows_b, active_rows,
-                    (col_num, row_num))
-            try:
-                value = D(col_value)
-            except DConversionError:
-                if not self._ignore:
-                    raise
-                continue
-            sum += value
-
-        return str(sum)
-
-
 if __name__ == '__main__':
-    import time
+    from demo import demo
 
-    from reportlab.lib.pagesizes import A4
-    from reportlab.platypus import BaseDocTemplate, Frame, PageTemplate
-    from reportlab.lib.units import mm
-    from reportlab.platypus.flowables import PageBreak, Spacer
-    from reportlab.platypus.paragraph import Paragraph
-    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-
-    styleSheet = getSampleStyleSheet()
-    MARGIN_SIZE = 25 * mm
-    PAGE_SIZE = A4
-
-    def get_test_data(cols, rows):
-        """
-        Generates test data for Table objects.
-        """
-        assert cols > 0
-        assert rows > 1
-
-        data = []
-        data.append(['Col %d' % col_num for col_num in xrange(cols)])
-        for row in xrange(rows - 1):
-            row_data = [row * cols + col for col in xrange(cols)]
-            data.append(row_data)
-
-        return data
-
-    def create_pdfdoc(pdfdoc, story):
-        """
-        Creates PDF doc from story.
-        """
-        pdf_doc = BaseDocTemplate(pdfdoc, pagesize = PAGE_SIZE,
-            leftMargin = MARGIN_SIZE, rightMargin = MARGIN_SIZE,
-            topMargin = MARGIN_SIZE, bottomMargin = MARGIN_SIZE)
-        main_frame = Frame(MARGIN_SIZE, MARGIN_SIZE,
-            PAGE_SIZE[0] - 2 * MARGIN_SIZE, PAGE_SIZE[1] - 2 * MARGIN_SIZE,
-            leftPadding = 0, rightPadding = 0, bottomPadding = 0,
-            topPadding = 0, id = 'main_frame')
-        main_template = PageTemplate(id = 'main_template', frames = [main_frame])
-        pdf_doc.addPageTemplates([main_template])
-
-        pdf_doc.build(story)
-
-    table_style = [
-        ('GRID', (0,0), (-1,-1), 1, colors.black),
-        ('ALIGN', (0,0), (-1,-1), 'CENTER'),
-        ('ROWBACKGROUNDS', (0,0), (-1, -1), (colors.red, colors.yellow)),
-        ('LEFTPADDING', (0,0), (-1,-1), 3),
-        ('RIGHTPADDING', (0,0), (-1,-1), 3),
-        #('FONTNAME', (0,0), (-1,-1), 'Times-Bold'),
-        #('FONTNAME', (1,1), (-2,-2), 'Times-Roman'),
-        ('FONTSIZE', (0,0), (-1,-1), 10)
-    ]
-
-    data = [
-        ['', 'Col 1', 'Col 2', 'Col3', 'Row sum'],
-        ['Row 1', 999991, 2, 3, RowSum()],
-        ['Row 2', 999994, 5, 6, RowSum()],
-        ['Row 3', 999997, 8, 9, RowSum()],
-        ['Row 3', 1, 8, 9, RowSum()],
-        ['Row 4', 2, 8, 9, RowSum()],
-        ['Row 5', 3, 8, 9, RowSum()],
-        ['Row 6', 4, 8, 9, RowSum()],
-        ['Row 7', 5, 8, 9, RowSum()],
-        ['Row 8', 6, 8, 9, RowSum()],
-        ['Row 9', 7, 8, 9, RowSum()],
-        ['Row 10', 8, 8, 9, RowSum()],
-        ['Row 11', 9, 8, 9, RowSum()],
-        ['Row 12', 1, 9, 9, RowSum()],
-        ['Row 13', 2, 9, 9, RowSum()],
-        ['Page col sum', PageColSum(), PageColSum(), PageColSum(), PageColSum()],
-    ]
-
-    print 'Generating Table to spreadsheet.pdf in current working directiory'
-    story = []
-    for i in range(1, 4):
-        table_style[2] = ('ROWBACKGROUNDS', (0,0), (-1, -i),
-            (colors.red, colors.yellow))
-        story.append(Paragraph("Backgrounds command = ('ROWBACKGROUNDS', (0,0), (-1, -%d), (colors.red, colors.yellow))" % i, styleSheet['BodyText']))
-        spreadsheet_table = SpreadsheetTable(data, repeatRows = 1,
-            repeatRowsB = 1)
-        spreadsheet_table.setStyle(table_style)
-        story.append(Paragraph("This shows how formulas behave without split. Notice that col sum formula for col 1 detected not enough space to draw itself so returned ### instead of value.", styleSheet['BodyText']))
-        story.append(Spacer(0, 10 * mm))
-        story.append(spreadsheet_table)
-        story.append(PageBreak())
-        story.append(Paragraph("This shows how formulas behave with split.",
-            styleSheet['BodyText']))
-        story.append(Spacer(0, 10 * mm))
-        spreadsheet_table = SpreadsheetTable(data, repeatRows = 1, repeatRowsB = 1)
-        spreadsheet_table.setStyle(table_style)
-        s = spreadsheet_table.split(PAGE_SIZE[0], 90)
-
-        for part in s:
-            story.append(part)
-            story.append(Spacer(0, 10 * mm))
-        story.append(PageBreak())
-
-    create_pdfdoc('spreadsheet.pdf', story)
-
-    print 'LongTables performance test...'
-    for row_num in xrange(1000, 6000, 1000):
-        data = get_test_data(cols=10, rows=row_num)
-        a = time.time()
-        table = SpreadsheetTable(data, repeatRows = 1, style = table_style)
-        create_pdfdoc('spreadsheet_%d.pdf' % row_num, [table])
-        b = time.time()
-        print 'SpreadsheetTable generation time (%d rows): %s.' % (row_num, b - a)
-
-    for row_num in xrange(1000, 6000, 1000):
-        table_style.append(('SPAN', (0,0), (1,0)))
-        data = get_test_data(cols=10, rows=row_num)
-        data[0][1] = ''
-
-        a = time.time()
-        table = SpreadsheetTable(data, repeatRows = 1, style = table_style)
-        create_pdfdoc('spreadsheet_%d_span.pdf' % row_num, [table])
-        b = time.time()
-        print 'SpreadsheetTable generation time with span (%d rows): %s.' % (row_num, b - a)
+    demo()
